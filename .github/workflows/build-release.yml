@@ -1,0 +1,275 @@
+name: Build & Release Static Binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v20260620)'
+        required: true
+        type: string
+
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      # ── Phase 1: Setup MSYS2 environment ──
+      - name: Setup MSYS2
+        id: setup-msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MSYS
+          update: true
+
+      - name: Install shared build dependencies
+        shell: msys2 {0}
+        run: |
+          pacman -S --noconfirm gcc make autoconf automake libtool pkg-config
+          pacman -S --noconfirm openssl openssl-devel
+          pacman -S --noconfirm libreadline libreadline-devel ncurses-devel
+
+
+
+      # ── Phase 2: Parallel builds (bash & / wait) ──
+      - name: Build ipmitool & net-snmp in parallel
+        shell: msys2 {0}
+        run: |
+          set -e
+
+          # ────────────────────────────────────────────
+          # ipmitool 1.8.19 (background)
+          # ────────────────────────────────────────────
+          build_ipmitool_pid=
+          (
+            mkdir -p /tmp/ipmitool-build
+            cd /tmp/ipmitool-build
+            curl -L -o ipmitool-1.8.19.tar.gz https://codeberg.org/IPMITool/ipmitool/archive/IPMITOOL_1_8_19.tar.gz
+            tar xzf ipmitool-1.8.19.tar.gz
+            cd ipmitool
+
+            # Patch configure.ac: remove git suffix for tarball build (use | delimiter to avoid / conflict)
+            sed -i 's|m4_define(\[git_suffix\], m4_esyscmd_s(./csv-revision))|m4_define([git_suffix], [])|' configure.ac
+
+            # Bootstrap
+            autoreconf -fi
+
+            # Download IANA PEN registry
+            curl -L -o /usr/share/misc/enterprise-numbers https://www.iana.org/assignments/enterprise-numbers.txt
+
+            # Configure
+            ./configure \
+              --enable-static \
+              --disable-shared \
+              --disable-intf-open \
+              LDFLAGS="-static" \
+              LIBS="-lcrypto -lssl -lcrypt32 -lws2_32 -ladvapi32 -luser32 -lreadline -lncurses" \
+              CFLAGS="-O2 -D_GNU_SOURCE" \
+              IANADIR=/usr/share/misc
+
+            # Build
+            make -j$(nproc)
+
+            # Manual static link (libtool can't produce true static binary on MSYS2/Cygwin)
+            gcc -static -O2 -D_GNU_SOURCE -o src/ipmitool.exe \
+              src/ipmitool.o src/ipmishell.o \
+              lib/.libs/libipmitool.a \
+              src/plugins/.libs/libintf.a \
+              src/plugins/lan/.libs/libintf_lan.a \
+              src/plugins/lanplus/.libs/libintf_lanplus.a \
+              src/plugins/serial/.libs/libintf_serial.a \
+              -lcrypto -lssl -lcrypt32 -lws2_32 -ladvapi32 -luser32 -lreadline -lncurses
+
+            gcc -static -O2 -D_GNU_SOURCE -o src/ipmievd.exe \
+              src/ipmievd.o \
+              lib/.libs/libipmitool.a \
+              src/plugins/.libs/libintf.a \
+              src/plugins/lan/.libs/libintf_lan.a \
+              src/plugins/lanplus/.libs/libintf_lanplus.a \
+              src/plugins/serial/.libs/libintf_serial.a \
+              -lcrypto -lssl -lcrypt32 -lws2_32 -ladvapi32 -luser32
+
+            # Verify
+            ldd src/ipmitool.exe
+            ldd src/ipmievd.exe
+            src/ipmitool.exe -V
+
+            echo "=== ipmitool build done ==="
+          ) &
+          build_ipmitool_pid=$!
+
+          # ────────────────────────────────────────────
+          # net-snmp 5.9.5.2 (background)
+          # ────────────────────────────────────────────
+          build_netsnmp_pid=
+          (
+            mkdir -p /tmp/net-snmp-build
+            cd /tmp/net-snmp-build
+            curl -L -o net-snmp-5.9.5.2.tar.gz https://github.com/net-snmp/net-snmp/archive/refs/tags/v5.9.5.2.tar.gz
+            tar xzf net-snmp-5.9.5.2.tar.gz
+            cd net-snmp-5.9.5.2
+
+            # Configure (no LDFLAGS="-static" — breaks OpenSSL detection)
+            ./configure \
+              --disable-shared \
+              --enable-static \
+              --with-openssl=/usr \
+              --disable-scripts \
+              --disable-manuals \
+              --disable-mibs \
+              --disable-agent \
+              --enable-blumenthal-aes \
+              --with-default-snmp-version="3" \
+              --with-sys-contact="root@localhost" \
+              --with-sys-location="unknown" \
+              --with-logfile="/var/log/snmpd.log" \
+              --with-persistent-directory="/var/net-snmp" \
+              CFLAGS="-O2 -D_GNU_SOURCE" \
+              LIBS="-lcrypto -lssl -lcrypt32 -lws2_32 -ladvapi32 -luser32"
+
+            # Patch: disable HAVE_CLOSESOCKET (Cygwin should use close(), not closesocket())
+            sed -i 's/^#define HAVE_CLOSESOCKET 1$/\/\* #undef HAVE_CLOSESOCKET \*\//' include/net-snmp/net-snmp-config.h
+
+            # Build
+            make -j$(nproc)
+
+            # Manual static link — SNMP client tools
+            for tool in snmpget snmpwalk snmpbulkwalk snmpbulkget snmpset snmpgetnext \
+                        snmptranslate snmpstatus snmptable snmptrap snmpdf snmpdelta \
+                        snmpusm snmpvacm encode_keychange snmptest snmpping; do
+              gcc -static -O2 -D_GNU_SOURCE -o apps/$tool.exe apps/$tool.o \
+                snmplib/.libs/libnetsnmp.a \
+                -lcrypto -lssl -lcrypt32 -lws2_32 -ladvapi32 -luser32 -liphlpapi -lsnmpapi
+            done
+
+            # Manual static link — snmpnetstat
+            gcc -static -O2 -D_GNU_SOURCE -o apps/snmpnetstat/snmpnetstat.exe \
+              apps/snmpnetstat/main.o apps/snmpnetstat/if.o apps/snmpnetstat/inet.o \
+              apps/snmpnetstat/inet6.o apps/snmpnetstat/route.o apps/snmpnetstat/routex.o \
+              apps/snmpnetstat/inetx.o apps/snmpnetstat/ffs.o apps/snmpnetstat/winstub.o \
+              snmplib/.libs/libnetsnmp.a \
+              -lcrypto -lssl -lcrypt32 -lws2_32 -ladvapi32 -luser32 -liphlpapi -lsnmpapi
+
+            # Manual static link — snmptrapd
+            gcc -static -O2 -D_GNU_SOURCE -o apps/snmptrapd.exe \
+              apps/snmptrapd.o apps/snmptrapd_log.o apps/snmptrapd_auth.o \
+              apps/snmptrapd_handlers.o apps/snmptrapd_sql.o \
+              agent/.libs/libnetsnmpmibs.a agent/.libs/libnetsnmpagent.a \
+              agent/helpers/.libs/libnetsnmphelpers.a snmplib/.libs/libnetsnmp.a \
+              -lcrypto -lssl -lcrypt32 -lws2_32 -ladvapi32 -luser32 -liphlpapi -lsnmpapi
+
+            # Verify
+            ldd apps/snmpget.exe
+            ldd apps/snmpwalk.exe
+            apps/snmpget.exe -V
+
+            echo "=== net-snmp build done ==="
+          ) &
+          build_netsnmp_pid=$!
+
+          # Wait for both builds to finish and check exit status
+          wait $build_ipmitool_pid
+          ipmitool_exit=$?
+          wait $build_netsnmp_pid
+          netsnmp_exit=$?
+          if [ $ipmitool_exit -ne 0 ]; then
+            echo "ERROR: ipmitool build failed with exit code $ipmitool_exit"
+            exit $ipmitool_exit
+          fi
+          if [ $netsnmp_exit -ne 0 ]; then
+            echo "ERROR: net-snmp build failed with exit code $netsnmp_exit"
+            exit $netsnmp_exit
+          fi
+          echo "=== All builds completed ==="
+
+      # ── Phase 3: Package ──
+      - name: Collect binaries & msys-2.0.dll
+        shell: msys2 {0}
+        run: |
+          set -e
+          mkdir -p /tmp/release/ipmitool /tmp/release/net-snmp
+
+          # Copy ipmitool binaries
+          cp /tmp/ipmitool-build/ipmitool/src/ipmitool.exe /tmp/release/ipmitool/
+          cp /tmp/ipmitool-build/ipmitool/src/ipmievd.exe /tmp/release/ipmitool/
+          cp /usr/share/misc/enterprise-numbers /tmp/release/ipmitool/
+
+          # Copy net-snmp binaries
+          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmpget.exe /tmp/release/net-snmp/
+          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmpwalk.exe /tmp/release/net-snmp/
+          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmpbulkwalk.exe /tmp/release/net-snmp/
+          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmpbulkget.exe /tmp/release/net-snmp/
+          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmpset.exe /tmp/release/net-snmp/
+          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmpgetnext.exe /tmp/release/net-snmp/
+          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmptranslate.exe /tmp/release/net-snmp/
+          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmpstatus.exe /tmp/release/net-snmp/
+          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmptable.exe /tmp/release/net-snmp/
+          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmptrap.exe /tmp/release/net-snmp/
+          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmpdf.exe /tmp/release/net-snmp/
+          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmpdelta.exe /tmp/release/net-snmp/
+          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmpusm.exe /tmp/release/net-snmp/
+          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmpvacm.exe /tmp/release/net-snmp/
+          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/encode_keychange.exe /tmp/release/net-snmp/
+          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmptest.exe /tmp/release/net-snmp/
+          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmpping.exe /tmp/release/net-snmp/
+          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmpnetstat/snmpnetstat.exe /tmp/release/net-snmp/
+          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmptrapd.exe /tmp/release/net-snmp/
+
+          # Copy msys-2.0.dll into both packages
+          MSYS_DLL="$(cygpath -w /usr/bin/msys-2.0.dll)"
+          echo "msys-2.0.dll path: $MSYS_DLL"
+          cp /usr/bin/msys-2.0.dll /tmp/release/ipmitool/
+          cp /usr/bin/msys-2.0.dll /tmp/release/net-snmp/
+
+          echo "=== Files collected ==="
+          ls -la /tmp/release/ipmitool/
+          ls -la /tmp/release/net-snmp/
+
+      - name: Create zip archives
+        shell: pwsh
+        run: |
+          # Use the actual MSYS2 installation path from the setup step
+          $msysDir = "${{ steps.setup-msys2.outputs.msys2-location }}"
+          $ipmitoolDir = "$msysDir\tmp\release\ipmitool"
+          $netsnmpDir  = "$msysDir\tmp\release\net-snmp"
+
+          Compress-Archive -Path "$ipmitoolDir\*" -DestinationPath "ipmitool-1.8.19-win64-static.zip" -Force
+          Compress-Archive -Path "$netsnmpDir\*"  -DestinationPath "net-snmp-5.9.5.2-win64-static.zip" -Force
+
+          Write-Host "=== Zip archives created ==="
+          Get-ChildItem *.zip | Format-Table Name, Length
+
+      # ── Phase 4: Release ──
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: Static Binaries ${{ inputs.tag }}
+          body: |
+            Static Windows binaries built with MSYS2 (x86_64).
+
+            ## ipmitool-1.8.19-win64-static.zip
+            - `ipmitool.exe` — IPMI management utility (static, lanplus enabled)
+            - `ipmievd.exe` — IPMI event daemon (static)
+            - `msys-2.0.dll` — MSYS2 runtime DLL (required)
+            - `enterprise-numbers` — IANA PEN registry
+
+            ## net-snmp-5.9.5.2-win64-static.zip
+            - 16 SNMP client tools: snmpget, snmpwalk, snmpbulkwalk, snmpbulkget, snmpset, snmpgetnext, snmptranslate, snmpstatus, snmptable, snmptrap, snmpdf, snmpdelta, snmpusm, snmpvacm, encode_keychange, snmptest, snmpping
+            - `snmpnetstat.exe` — SNMP network statistics
+            - `snmptrapd.exe` — SNMP trap daemon
+            - `msys-2.0.dll` — MSYS2 runtime DLL (required)
+
+            **Note:** `msys-2.0.dll` must be in the same directory as the executables or in the system PATH.
+          files: |
+            ipmitool-1.8.19-win64-static.zip
+            net-snmp-5.9.5.2-win64-static.zip
+
+      - name: Setup tmate session
+        if: ${{ failure() }}
+        uses: mxschmitt/action-tmate@v3
+        with:
+          msys2-location: ${{ steps.setup-msys2.outputs.msys2-location }}
