@@ -25,23 +25,34 @@ autoreconf -fi
 sed -i '/hints.ai_flags.*=.*0;/c\	hints.ai_flags    = AI_ADDRCONFIG; /* skip DNS for numeric IPs below */' src/plugins/ipmi_intf.c
 sed -i '/if (getaddrinfo(params->hostname, service, \&hints, \&rp0)/i\	/* If hostname is a numeric IP, skip DNS resolution entirely */\n	struct in_addr addr_test;\n	if (inet_pton(AF_INET, params->hostname, \&addr_test) == 1)\n		hints.ai_flags |= AI_NUMERICHOST;' src/plugins/ipmi_intf.c
 
-## 6. 下载 IANA PEN registry 文件
-curl -L -o /usr/share/misc/enterprise-numbers https://www.iana.org/assignments/enterprise-numbers.txt
+## 5.2 Patch: 静默 IANA PEN registry 缺失错误
+# 完整调用链: ipmi_main.c → ipmi_oem_info_init() → oem_info_list_load()
+#
+# 问题1: oem_info_list_load() 找不到 enterprise-numbers 文件时:
+#   - lperror 打印 "IANA PEN registry open failed"
+#   - return -1 (错误)
+# 修复: 将 lperror 行替换为 return 0 (空列表，非错误)
+sed -i 's/\t\t\tlperror(LOG_ERR, "IANA PEN registry open failed");/\t\t\treturn 0;/' lib/ipmi_strings.c
+#
+# 问题2: ipmi_oem_info_init() 中 rc 默认为 -4 (失败):
+#   - oem_info_list_load() 返回 0 时进入 dummy 回退分支
+#   - 但 rc 未设为 0，仍为 -4 → 调用方 ipmi_main.c 判定失败并 abort
+# 修复: 在 dummy 回退分支中设置 rc = 0 (空 registry 不是致命错误)
+sed -i '/ipmi_oem_info = ipmi_oem_info_dummy;/a\\t\trc = 0;' lib/ipmi_strings.c
 
-## 7. Configure (启用 lanplus + 静态链接 + IANADIR)
+## 6. Configure (启用 lanplus + 静态链接)
 ./configure \
   --enable-static \
   --disable-shared \
   --disable-openipmi \
   LDFLAGS="-static" \
   LIBS="-lcrypto -lssl -lcrypt32 -ladvapi32 -luser32 -lreadline -lncurses" \
-  CFLAGS="-O2 -D_GNU_SOURCE" \
-  IANADIR=/usr/share/misc
+  CFLAGS="-O2 -D_GNU_SOURCE"
 
-## 8. 编译
+## 7. 编译
 make -j12
 
-## 9. 手动静态链接 (libtool 在 MSYS2/Cygwin 下无法生成真正静态二进制)
+## 8. 手动静态链接 (libtool 在 MSYS2/Cygwin 下无法生成真正静态二进制)
 gcc -static -O2 -D_GNU_SOURCE -o src/ipmitool.exe \
   src/ipmitool.o src/ipmishell.o \
   lib/.libs/libipmitool.a \
@@ -60,11 +71,11 @@ gcc -static -O2 -D_GNU_SOURCE -o src/ipmievd.exe \
   src/plugins/serial/.libs/libintf_serial.a \
   -lcrypto -lssl -lcrypt32 -ladvapi32 -luser32
 
-## 10. 验证静态链接 (只应依赖 Windows 系统 DLL)
+## 9. 验证静态链接 (只应依赖 Windows 系统 DLL)
 ldd src/ipmitool.exe
 ldd src/ipmievd.exe
 
-## 11. 测试二进制
+## 10. 测试二进制
 src/ipmitool.exe -V
 src/ipmitool.exe -I list
 src/ipmitool.exe -o list
@@ -76,8 +87,7 @@ src/ipmitool.exe -o list
 #   - 不链接 -lws2_32: MSYS 环境下 socket/getaddrinfo 由 msys-2.0.dll (Cygwin POSIX 层) 提供，
 #     链接 Winsock 的 ws2_32 会造成 getaddrinfo 符号冲突，导致 "Address lookup failed"
 #   - AI_NUMERICHOST patch: 数字 IP 地址跳过 DNS 解析，避免 DNS 不可用时报错
+#   - IANA PEN registry patch: 静默缺失 enterprise-numbers 文件的错误，
+#     ipmitool 仍可正常工作，只是 IANA 编号显示为数字而非厂商名
 #   - readline: 静态链接需要显式指定 -lreadline -lncurses
 #   - 手动 gcc -static: libtool 在 MSYS2 下默认动态链接，需手动链接
-#   - IANADIR: 编译时指定 IANA PEN registry 文件路径，避免运行时下载
-#   - 部署时需将 enterprise-numbers 文件放到目标机器对应路径，
-#     或放在用户目录 ~/.ipmitool/ 下 (ipmitool 会优先查找此路径)

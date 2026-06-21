@@ -2,11 +2,6 @@ name: Build & Release Static Binaries
 
 on:
   workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Release tag (e.g. v20260620)'
-        required: true
-        type: string
 
 
 permissions:
@@ -17,6 +12,26 @@ jobs:
     runs-on: windows-latest
 
     steps:
+      # ── Phase 0: Generate monthly tag & delete previous same-month release ──
+      - name: Generate tag & cleanup previous release
+        id: tag
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Tag format: vYYYYMM (e.g. v202606), one per month, overwrites previous
+          $TAG = "v" + (Get-Date -Format "yyyyMM")
+          "tag=$TAG" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Generated tag: $TAG"
+
+          # Delete existing release & tag for this month (if any) so we overwrite
+          # Use --silent and swallow errors (release may not exist on first run)
+          gh release delete $TAG --yes --cleanup-tag --repo $env:GITHUB_REPOSITORY 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "No previous release to delete (first run this month)"
+            $global:LASTEXITCODE = 0
+          }
+
       # ── Phase 1: Setup MSYS2 environment ──
       - name: Setup MSYS2
         id: setup-msys2
@@ -28,9 +43,8 @@ jobs:
       - name: Install shared build dependencies
         shell: msys2 {0}
         run: |
-          pacman -S --noconfirm gcc make autoconf automake libtool pkg-config
-          pacman -S --noconfirm openssl openssl-devel
-          pacman -S --noconfirm libreadline libreadline-devel ncurses-devel
+          pacman -S --noconfirm gcc make autoconf automake libtool pkg-config \
+            openssl openssl-devel libreadline libreadline-devel ncurses-devel zip
 
 
 
@@ -62,8 +76,18 @@ jobs:
             sed -i '/hints.ai_flags.*=.*0;/c\	hints.ai_flags    = AI_ADDRCONFIG; /* skip DNS for numeric IPs below */' src/plugins/ipmi_intf.c
             sed -i '/if (getaddrinfo(params->hostname, service, \&hints, \&rp0)/i\	/* If hostname is a numeric IP, skip DNS resolution entirely */\n	struct in_addr addr_test;\n	if (inet_pton(AF_INET, params->hostname, \&addr_test) == 1)\n		hints.ai_flags |= AI_NUMERICHOST;' src/plugins/ipmi_intf.c
 
-            # Download IANA PEN registry
-            curl -L -o /usr/share/misc/enterprise-numbers https://www.iana.org/assignments/enterprise-numbers.txt
+            # Patch: silence "IANA PEN registry open failed" error when enterprise-numbers is missing
+            # Call chain: ipmi_main.c → ipmi_oem_info_init() → oem_info_list_load()
+            #
+            # Fix 1: oem_info_list_load() prints lperror + returns -1 when file not found.
+            #        Replace lperror line with "return 0;" (empty list, not an error).
+            sed -i 's/\t\t\tlperror(LOG_ERR, "IANA PEN registry open failed");/\t\t\treturn 0;/' lib/ipmi_strings.c
+            #
+            # Fix 2: ipmi_oem_info_init() has rc=-4 (failure) by default. When oem_info_list_load()
+            #        returns 0, it enters the dummy fallback but never sets rc=0, so the caller
+            #        (ipmi_main.c) sees failure and aborts with "Failed to initialize the OEM info dictionary".
+            #        Add "rc = 0;" after the dummy fallback assignment.
+            sed -i '/ipmi_oem_info = ipmi_oem_info_dummy;/a\\t\trc = 0;' lib/ipmi_strings.c
 
             # Configure
             ./configure \
@@ -72,8 +96,7 @@ jobs:
               --disable-intf-open \
               LDFLAGS="-static" \
               LIBS="-lcrypto -lssl -lcrypt32 -ladvapi32 -luser32 -lreadline -lncurses" \
-              CFLAGS="-O2 -D_GNU_SOURCE" \
-              IANADIR=.
+              CFLAGS="-O2 -D_GNU_SOURCE"
 
             # Build
             make -j$(nproc)
@@ -180,10 +203,14 @@ jobs:
           build_netsnmp_pid=$!
 
           # Wait for both builds to finish and check exit status
+          # Note: `wait $pid` returns the subshell exit code; `set -e` is disabled
+          # around it so we can capture and report which build failed.
+          set +e
           wait $build_ipmitool_pid
           ipmitool_exit=$?
           wait $build_netsnmp_pid
           netsnmp_exit=$?
+          set -e
           if [ $ipmitool_exit -ne 0 ]; then
             echo "ERROR: ipmitool build failed with exit code $ipmitool_exit"
             exit $ipmitool_exit
@@ -195,7 +222,7 @@ jobs:
           echo "=== All builds completed ==="
 
       # ── Phase 3: Package ──
-      - name: Collect binaries & msys-2.0.dll
+      - name: Collect binaries & create zip archives
         shell: msys2 {0}
         run: |
           set -e
@@ -204,32 +231,11 @@ jobs:
           # Copy ipmitool binaries
           cp /tmp/ipmitool-build/ipmitool/src/ipmitool.exe /tmp/release/ipmitool/
           cp /tmp/ipmitool-build/ipmitool/src/ipmievd.exe /tmp/release/ipmitool/
-          cp /usr/share/misc/enterprise-numbers /tmp/release/ipmitool/
 
-          # Copy net-snmp binaries
-          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmpget.exe /tmp/release/net-snmp/
-          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmpwalk.exe /tmp/release/net-snmp/
-          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmpbulkwalk.exe /tmp/release/net-snmp/
-          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmpbulkget.exe /tmp/release/net-snmp/
-          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmpset.exe /tmp/release/net-snmp/
-          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmpgetnext.exe /tmp/release/net-snmp/
-          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmptranslate.exe /tmp/release/net-snmp/
-          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmpstatus.exe /tmp/release/net-snmp/
-          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmptable.exe /tmp/release/net-snmp/
-          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmptrap.exe /tmp/release/net-snmp/
-          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmpdf.exe /tmp/release/net-snmp/
-          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmpdelta.exe /tmp/release/net-snmp/
-          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmpusm.exe /tmp/release/net-snmp/
-          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmpvacm.exe /tmp/release/net-snmp/
-          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/encode_keychange.exe /tmp/release/net-snmp/
-          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmptest.exe /tmp/release/net-snmp/
-          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmpping.exe /tmp/release/net-snmp/
-          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmpnetstat/snmpnetstat.exe /tmp/release/net-snmp/
-          cp /tmp/net-snmp-build/net-snmp-5.9.5.2/apps/snmptrapd.exe /tmp/release/net-snmp/
+          # Copy all net-snmp .exe (apps/ + apps/snmpnetstat/) in one shot
+          find /tmp/net-snmp-build/net-snmp-5.9.5.2/apps -name '*.exe' -exec cp {} /tmp/release/net-snmp/ \;
 
           # Copy msys-2.0.dll into both packages
-          MSYS_DLL="$(cygpath -w /usr/bin/msys-2.0.dll)"
-          echo "msys-2.0.dll path: $MSYS_DLL"
           cp /usr/bin/msys-2.0.dll /tmp/release/ipmitool/
           cp /usr/bin/msys-2.0.dll /tmp/release/net-snmp/
 
@@ -237,26 +243,20 @@ jobs:
           ls -la /tmp/release/ipmitool/
           ls -la /tmp/release/net-snmp/
 
-      - name: Create zip archives
-        shell: pwsh
-        run: |
-          # Use the actual MSYS2 installation path from the setup step
-          $msysDir = "${{ steps.setup-msys2.outputs.msys2-location }}"
-          $ipmitoolDir = "$msysDir\tmp\release\ipmitool"
-          $netsnmpDir  = "$msysDir\tmp\release\net-snmp"
+          # Create zip archives (zip is installed in Phase 1)
+          cd /tmp/release
+          zip -r "$GITHUB_WORKSPACE/ipmitool-1.8.19-win64-static.zip" ipmitool
+          zip -r "$GITHUB_WORKSPACE/net-snmp-5.9.5.2-win64-static.zip" net-snmp
 
-          Compress-Archive -Path "$ipmitoolDir\*" -DestinationPath "ipmitool-1.8.19-win64-static.zip" -Force
-          Compress-Archive -Path "$netsnmpDir\*"  -DestinationPath "net-snmp-5.9.5.2-win64-static.zip" -Force
-
-          Write-Host "=== Zip archives created ==="
-          Get-ChildItem *.zip | Format-Table Name, Length
+          echo "=== Zip archives created ==="
+          ls -la "$GITHUB_WORKSPACE"/*.zip
 
       # ── Phase 4: Release ──
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ inputs.tag }}
-          name: Static Binaries ${{ inputs.tag }}
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Static Binaries ${{ steps.tag.outputs.tag }}
           body: |
             Static Windows binaries built with MSYS2 (x86_64).
 
@@ -264,12 +264,11 @@ jobs:
             - `ipmitool.exe` — IPMI management utility (static, lanplus enabled)
             - `ipmievd.exe` — IPMI event daemon (static)
             - `msys-2.0.dll` — MSYS2 runtime DLL (required)
-            - `enterprise-numbers` — IANA PEN registry
 
-            **Fix:** Removed `-lws2_32` from link line to avoid Winsock/Cygwin `getaddrinfo` symbol conflict. Added `AI_NUMERICHOST` patch to bypass DNS for numeric IP addresses.
+            **Fix:** Removed `-lws2_32` from link line to avoid Winsock/Cygwin `getaddrinfo` symbol conflict. Added `AI_NUMERICHOST` patch to bypass DNS for numeric IP addresses. Silenced "IANA PEN registry open failed" error (ipmitool works without the registry file, IANA numbers display as numbers instead of vendor names).
 
             ## net-snmp-5.9.5.2-win64-static.zip
-            - 16 SNMP client tools: snmpget, snmpwalk, snmpbulkwalk, snmpbulkget, snmpset, snmpgetnext, snmptranslate, snmpstatus, snmptable, snmptrap, snmpdf, snmpdelta, snmpusm, snmpvacm, encode_keychange, snmptest, snmpping
+            - 17 SNMP client tools: snmpget, snmpwalk, snmpbulkwalk, snmpbulkget, snmpset, snmpgetnext, snmptranslate, snmpstatus, snmptable, snmptrap, snmpdf, snmpdelta, snmpusm, snmpvacm, encode_keychange, snmptest, snmpping
             - `snmpnetstat.exe` — SNMP network statistics
             - `snmptrapd.exe` — SNMP trap daemon
             - `msys-2.0.dll` — MSYS2 runtime DLL (required)
