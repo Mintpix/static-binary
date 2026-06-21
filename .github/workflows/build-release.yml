@@ -138,6 +138,10 @@ jobs:
             # Patch: disable HAVE_CLOSESOCKET (Cygwin should use close(), not closesocket())
             sed -i 's/^#define HAVE_CLOSESOCKET 1$/\/\* #undef HAVE_CLOSESOCKET \*\//' include/net-snmp/net-snmp-config.h
 
+            # Patch: clear default MIB list to avoid "MIB search path:" and "Cannot find module" errors
+            # (--disable-mibs doesn't install MIB files, but NETSNMP_DEFAULT_MIBS still tries to load them)
+            sed -i 's/^#define NETSNMP_DEFAULT_MIBS .*/#define NETSNMP_DEFAULT_MIBS ""/' include/net-snmp/net-snmp-config.h
+
             # Build
             make -j$(nproc)
 

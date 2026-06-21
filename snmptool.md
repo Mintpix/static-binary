@@ -34,8 +34,15 @@ pacman -S --noconfirm openssl openssl-devel
   CFLAGS="-O2 -D_GNU_SOURCE" \
   LIBS="-lcrypto -lssl -lcrypt32 -ladvapi32 -luser32"
 
-## 5. 修补 config: 禁用 HAVE_CLOSESOCKET (Cygwin 中应使用 close() 而非 closesocket())
+## 5. 修补 config
+# 5a. 禁用 HAVE_CLOSESOCKET (Cygwin 中应使用 close() 而非 closesocket())
 sed -i 's/^#define HAVE_CLOSESOCKET 1$/\/\* #undef HAVE_CLOSESOCKET \*\//' include/net-snmp/net-snmp-config.h
+
+# 5b. 清空默认 MIB 列表，避免 "MIB search path:" 和 "Cannot find module" 错误
+#     原因: --disable-mibs 不安装 MIB 文件，但 NETSNMP_DEFAULT_MIBS 仍默认加载
+#           IP-MIB/IF-MIB/TCP-MIB/UDP-MIB/SNMPv2-MIB/RFC1213-MIB，全部找不到就报错
+#     注意: --with-mibs="" 无效，configure 会把空值重置回默认值，必须 patch 头文件
+sed -i 's/^#define NETSNMP_DEFAULT_MIBS .*/#define NETSNMP_DEFAULT_MIBS ""/' include/net-snmp/net-snmp-config.h
 
 ## 6. 编译
 make -j12
